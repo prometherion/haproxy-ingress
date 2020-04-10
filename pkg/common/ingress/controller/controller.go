@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/golang/glog"
-
 	apiv1 "k8s.io/api/core/v1"
 	extensions "k8s.io/api/extensions/v1beta1"
 	clientset "k8s.io/client-go/kubernetes"
@@ -50,6 +49,7 @@ type GenericController struct {
 	syncRateLimiter flowcontrol.RateLimiter
 	stopLock        *sync.Mutex
 	stopCh          chan struct{}
+	lookup          Lookup
 }
 
 // Configuration contains all the settings required by an Ingress controller
@@ -116,6 +116,7 @@ func newIngressController(config *Configuration) *GenericController {
 			Component: "ingress-controller",
 		}),
 		sslCertTracker: newSSLCertTracker(),
+		lookup:         newRelationshipLookup(&sync.RWMutex{}),
 	}
 
 	ic.syncQueue = task.NewTaskQueue(ic.syncIngress)

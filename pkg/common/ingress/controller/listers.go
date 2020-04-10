@@ -20,8 +20,6 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/jcmoraisjr/haproxy-ingress/pkg/common/ingress"
-
 	"github.com/golang/glog"
 	apiv1 "k8s.io/api/core/v1"
 	extensions "k8s.io/api/extensions/v1beta1"
@@ -29,9 +27,13 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/jcmoraisjr/haproxy-ingress/pkg/common/ingress"
 )
 
 type cacheController struct {
+	lookup Lookup
+
 	Ingress   cache.Controller
 	Endpoint  cache.Controller
 	Service   cache.Controller
@@ -88,6 +90,9 @@ func (ic *GenericController) createListers(disableNodeLister bool) (*ingress.Sto
 					addIng.Namespace, addIng.Name, IngressClassKey, a)
 				return
 			}
+			if err := ic.lookup.Populate(*addIng); err != nil {
+				glog.Warningf("cannot populate the in-memory lookup map: %s", err.Error())
+			}
 			ic.recorder.Eventf(addIng, apiv1.EventTypeNormal, "CREATE", fmt.Sprintf("Ingress %s/%s", addIng.Namespace, addIng.Name))
 			ic.syncQueue.Enqueue(obj)
 		},
@@ -111,6 +116,9 @@ func (ic *GenericController) createListers(disableNodeLister bool) (*ingress.Sto
 					delIng.Namespace, delIng.Name, IngressClassKey)
 				return
 			}
+			if err := ic.lookup.Depopulate(*delIng); err != nil {
+				glog.Warningf("cannot depopulate the in-memory lookup map: %s", err.Error())
+			}
 			ic.recorder.Eventf(delIng, apiv1.EventTypeNormal, "DELETE", fmt.Sprintf("Ingress %s/%s", delIng.Namespace, delIng.Name))
 			ic.syncQueue.Enqueue(obj)
 		},
@@ -122,10 +130,22 @@ func (ic *GenericController) createListers(disableNodeLister bool) (*ingress.Sto
 			if !validOld && validCur {
 				glog.Infof("creating ingress %v based on annotation %v", curIng.Name, IngressClassKey)
 				ic.recorder.Eventf(curIng, apiv1.EventTypeNormal, "CREATE", fmt.Sprintf("Ingress %s/%s", curIng.Namespace, curIng.Name))
+				if err := ic.lookup.Populate(*curIng); err != nil {
+					glog.Warningf("cannot populate the in-memory lookup map: %s", err.Error())
+				}
 			} else if validOld && !validCur {
 				glog.Infof("removing ingress %v based on annotation %v", curIng.Name, IngressClassKey)
 				ic.recorder.Eventf(curIng, apiv1.EventTypeNormal, "DELETE", fmt.Sprintf("Ingress %s/%s", curIng.Namespace, curIng.Name))
+				if err := ic.lookup.Depopulate(*oldIng); err != nil {
+					glog.Warningf("cannot depopulate the in-memory lookup map: %s", err.Error())
+				}
 			} else if validCur && !reflect.DeepEqual(old, cur) {
+				if err := ic.lookup.Depopulate(*curIng); err != nil {
+					glog.Warningf("cannot depopulate the in-memory lookup map: %s", err.Error())
+				}
+				if err := ic.lookup.Populate(*curIng); err != nil {
+					glog.Warningf("cannot populate the in-memory lookup map: %s", err.Error())
+				}
 				ic.recorder.Eventf(curIng, apiv1.EventTypeNormal, "UPDATE", fmt.Sprintf("Ingress %s/%s", curIng.Namespace, curIng.Name))
 			}
 
@@ -137,13 +157,45 @@ func (ic *GenericController) createListers(disableNodeLister bool) (*ingress.Sto
 	secretInformer := si.Core().V1().Secrets()
 	secretInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			ic.syncQueue.Enqueue(obj)
+			sec, ok := obj.(*apiv1.Secret)
+			if !ok {
+				glog.Errorf("wrong object from the cache: %v", obj)
+				return
+			}
+			il, err := ic.lookup.List(secret, sec)
+			if err != nil {
+				glog.Warningf(
+					"cannot retrieve ingress resources related to secret %s/%s from the in-memory lookup map: %s",
+					sec.Namespace, sec.Name, err.Error(),
+				)
+				return
+			}
+			for _, i := range il {
+				ic.syncQueue.Enqueue(i)
+			}
 		},
 		UpdateFunc: func(old, cur interface{}) {
-			if !reflect.DeepEqual(old, cur) {
-				sec := cur.(*apiv1.Secret)
-				key := fmt.Sprintf("%v/%v", sec.Namespace, sec.Name)
-				ic.syncSecret(key)
+			if reflect.DeepEqual(old, cur) {
+				return
+			}
+			sec, ok := cur.(*apiv1.Secret)
+			if !ok {
+				glog.Errorf("wrong object from the cache: %v", cur)
+				return
+			}
+			key := fmt.Sprintf("%v/%v", sec.Namespace, sec.Name)
+			ic.syncSecret(key)
+
+			il, err := ic.lookup.List(secret, sec)
+			if err != nil {
+				glog.Warningf(
+					"cannot retrieve ingress resources related to secret %s/%s from the in-memory lookup map: %s",
+					sec.Namespace, sec.Name, err.Error(),
+				)
+				return
+			}
+			for _, i := range il {
+				ic.syncQueue.Enqueue(i)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -163,7 +215,17 @@ func (ic *GenericController) createListers(disableNodeLister bool) (*ingress.Sto
 			}
 			key := fmt.Sprintf("%v/%v", sec.Namespace, sec.Name)
 			ic.sslCertTracker.DeleteAll(key)
-			ic.syncQueue.Enqueue(sec)
+			il, err := ic.lookup.Remove(secret, sec)
+			if err != nil {
+				glog.Warningf(
+					"cannot retrieve ingress resources related to secret %s from the in-memory lookup map: %s",
+					key, err.Error(),
+				)
+				return
+			}
+			for _, i := range il {
+				ic.syncQueue.Enqueue(i)
+			}
 		},
 	})
 	lister.Secret.Lister, controller.Secret = secretInformer.Lister(), secretInformer.Informer()
@@ -171,16 +233,79 @@ func (ic *GenericController) createListers(disableNodeLister bool) (*ingress.Sto
 	endpointInformer := si.Core().V1().Endpoints()
 	endpointInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			ic.syncQueue.Enqueue(obj)
+			ep, ok := obj.(*apiv1.Endpoints)
+			if !ok {
+				glog.Errorf("wrong object from the cache: %v", obj)
+				return
+			}
+			il, err := ic.lookup.List(endpoint, ep)
+			if err != nil {
+				glog.Warningf(
+					"cannot retrieve ingress resources related to endpoint %s/%s from the in-memory lookup map: %s",
+					ep.Namespace, ep.Name, err.Error(),
+				)
+				return
+			}
+			for _, i := range il {
+				ic.syncQueue.Enqueue(i)
+			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			ic.syncQueue.Enqueue(obj)
+			ep, ok := obj.(*apiv1.Endpoints)
+			if !ok {
+				// If we reached here it means the secret was deleted but its final state is unrecorded.
+				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					glog.Errorf("couldn't get object from tombstone %#v", obj)
+					return
+				}
+				ep, ok = tombstone.Obj.(*apiv1.Endpoints)
+				if !ok {
+					glog.Errorf("Tombstone contained object that is not an Endpoint: %#v", obj)
+					return
+				}
+			}
+			il, err := ic.lookup.Remove(endpoint, ep)
+			if err != nil {
+				glog.Warningf(
+					"cannot retrieve ingress resources related to endpoint %s/%s from the in-memory lookup map: %s",
+					ep.Namespace, ep.Name, err.Error(),
+				)
+				return
+			}
+			for _, i := range il {
+				ic.syncQueue.Enqueue(i)
+			}
 		},
 		UpdateFunc: func(old, cur interface{}) {
-			oep := old.(*apiv1.Endpoints)
-			ocur := cur.(*apiv1.Endpoints)
-			if !reflect.DeepEqual(ocur.Subsets, oep.Subsets) {
-				ic.syncQueue.Enqueue(cur)
+			oep, ok := old.(*apiv1.Endpoints)
+			if !ok {
+				glog.Errorf("wrong object from the cache: %v", old)
+				return
+			}
+			ocur, ok := cur.(*apiv1.Endpoints)
+			if !ok {
+				glog.Errorf("wrong object from the cache: %v", cur)
+				return
+			}
+
+			if reflect.DeepEqual(ocur.Subsets, oep.Subsets) {
+				return
+			}
+
+			var il []extensions.Ingress
+			var err error
+
+			il, err = ic.lookup.List(endpoint, ocur)
+			if err != nil {
+				glog.Warningf(
+					"cannot retrieve ingress resources related to endpoint %s/%s from the in-memory lookup map: %s",
+					oep.Namespace, oep.Name, err.Error(),
+				)
+				return
+			}
+			for _, i := range il {
+				ic.syncQueue.Enqueue(i)
 			}
 		},
 	})
@@ -207,7 +332,9 @@ func (ic *GenericController) createListers(disableNodeLister bool) (*ingress.Sto
 				// updates to configuration configmaps can trigger an update
 				if mapKey == ic.cfg.ConfigMapName || mapKey == ic.cfg.TCPConfigMapName {
 					ic.recorder.Eventf(upCmap, apiv1.EventTypeNormal, "UPDATE", fmt.Sprintf("ConfigMap %v", mapKey))
-					ic.syncQueue.Enqueue(cur)
+					// enqueuing a nil just to update the config map in order
+					// to perform the live reload of the HAProxy configuration.
+					ic.syncQueue.Enqueue(nil)
 				}
 			}
 		},
@@ -215,8 +342,68 @@ func (ic *GenericController) createListers(disableNodeLister bool) (*ingress.Sto
 	lister.ConfigMap.Lister, controller.ConfigMap = cmInformer.Lister(), cmInformer.Informer()
 
 	serviceInformer := si.Core().V1().Services()
+	serviceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			if reflect.DeepEqual(oldObj, newObj) {
+				return
+			}
+			newSvc, ok := newObj.(*apiv1.Service)
+			if !ok {
+				glog.Errorf("wrong object from the cache: %v", newObj)
+				return
+			}
+
+			var il []extensions.Ingress
+			var err error
+
+			il, err = ic.lookup.List(service, newSvc)
+			if err != nil {
+				glog.Warningf(
+					"cannot retrieve ingress resources related to service %s/%s from the in-memory lookup map: %s",
+					newSvc.Namespace, newSvc.Name, err.Error(),
+				)
+				return
+			}
+			for _, i := range il {
+				ic.syncQueue.Enqueue(i)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			svc, ok := obj.(*apiv1.Service)
+			if !ok {
+				// If we reached here it means the secret was deleted but its final state is unrecorded.
+				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					glog.Errorf("couldn't get object from tombstone %#v", obj)
+					return
+				}
+				svc, ok = tombstone.Obj.(*apiv1.Service)
+				if !ok {
+					glog.Errorf("Tombstone contained object that is not an Endpoint: %#v", obj)
+					return
+				}
+			}
+
+			var il []extensions.Ingress
+			var err error
+
+			il, err = ic.lookup.Remove(service, svc)
+			if err != nil {
+				glog.Warningf(
+					"cannot retrieve ingress resources related to service %s/%s from the in-memory lookup map: %s",
+					svc.Namespace, svc.Name, err.Error(),
+				)
+				return
+			}
+			for _, i := range il {
+				ic.syncQueue.Enqueue(i)
+			}
+		},
+	})
 	lister.Service.Lister, controller.Service = serviceInformer.Lister(), serviceInformer.Informer()
 
+	// TODO(prometherion): https://github.com/jcmoraisjr/haproxy-ingress/issues/547#issuecomment-611929802
+	// should be removed
 	podInformer := si.Core().V1().Pods()
 	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		DeleteFunc: func(obj interface{}) {
@@ -232,6 +419,8 @@ func (ic *GenericController) createListers(disableNodeLister bool) (*ingress.Sto
 	})
 	lister.Pod.Lister, controller.Pod = podInformer.Lister(), podInformer.Informer()
 
+	// TODO(prometherion): https://github.com/jcmoraisjr/haproxy-ingress/issues/547#issuecomment-610380342
+	// should be removed: old controller inheritance
 	if disableNodeLister {
 		cs := fake.NewSimpleClientset()
 		si = informers.NewSharedInformerFactory(cs, 0)
